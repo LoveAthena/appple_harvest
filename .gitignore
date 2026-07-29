@@ -1,0 +1,33 @@
+# Pixi (the environment dir is generated; the lock file IS committed for reproducibility)
+.pixi/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Outputs (renders, metrics, experiment results)
+output/
+*.png
+*.usda
+*.usd
+metric*.json
+
+# Videos (kept out of the repo)
+*.mp4
+*.mov
+*.webm
+*.mkv
+
+# ...but keep committed documentation images
+!assets/
+!assets/*.png
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

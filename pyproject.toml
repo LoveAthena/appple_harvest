@@ -1,0 +1,65 @@
+[project]
+name = "orchardbench"
+version = "0.1.0"
+description = "A physically-grounded, GPU-parallel apple-orchard simulation benchmark for agricultural robotics (NVIDIA Newton / MuJoCo-Warp)."
+readme = "README.md"
+requires-python = ">=3.10,<3.13"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Humphrey Munn", email = "h.munn@uq.net.au" }]
+keywords = ["robotics", "simulation", "agriculture", "benchmark", "domain-randomization"]
+
+# Runtime dependencies.  `newton` pulls in warp-lang and mujoco-warp; the
+# `[examples]` extra adds the OpenGL viewer (pyglet) and USD support.  Pinned to
+# the versions this release was developed and tested against.
+dependencies = [
+    "newton[examples]==1.3.0",
+    "numpy>=1.26",
+    "scipy>=1.11",       # perception (sphere fitting, connected components)
+    "matplotlib>=3.7",   # analysis plots
+    "pandas>=2.0",       # analysis tables
+    "pillow>=10.0",      # PNG screenshot writing
+    "tabulate>=0.9",     # pretty result tables (optional, graceful fallback)
+]
+
+[project.urls]
+Homepage = "https://example.org/orchardbench"  # TODO: final project page
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["treesim"]
+
+# --------------------------------------------------------------------------- #
+# Pixi: one-command, reproducible install (https://pixi.sh).
+#   curl -fsSL https://pixi.sh/install.sh | bash    # once, if you don't have it
+#   pixi install                                    # create the environment
+#   pixi run demo                                    # try it
+# --------------------------------------------------------------------------- #
+[tool.pixi.workspace]
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[tool.pixi.dependencies]
+python = "3.12.*"
+
+# newton[examples] pulls open3d, whose wheels are manylinux_2_31; declare the
+# glibc floor so the resolver accepts them (any host with glibc >= 2.31).
+[tool.pixi.system-requirements]
+libc = "2.31"
+
+[tool.pixi.pypi-dependencies]
+orchardbench = { path = ".", editable = true }
+
+[tool.pixi.tasks]
+# A random deformable apple tree you can push around (new tree every run)
+demo = "python scripts/grow_tree.py --apples --foliage --viewer gl"
+# Autonomous harvesting: detect, reach, grasp, pull, drop in the bucket
+harvest = "python scripts/grow_tree.py --auto --foliage --break --viewer gl"
+# Drive a RidgebackFranka around the orchard (W/S/A/D)
+drive = "python scripts/grow_tree.py --apples --foliage --break --robot --viewer gl"
+# A batched, domain-randomized orchard (each env a different tree)
+orchard = "python scripts/grow_tree.py --apples --num-envs 6 --randomize-envs --viewer gl"
+# Headless smoke test / benchmark
+bench = "python scripts/grow_tree.py --viewer null --frames 120 --apples --break"
