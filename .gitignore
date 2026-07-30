@@ -31,3 +31,4 @@ metric*.json
 .vscode/
 .idea/
 .DS_Store
+demo_data/

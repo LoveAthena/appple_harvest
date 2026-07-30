@@ -1,5 +1,16 @@
 """Gamepad-driven human teleop recording for imitation learning.
 
+Mapping:
+    D-pad       chassis drive (position increment per frame)
+    Left stick  J1(waist) / J2(shoulder)
+    Right stick J4(elbow) / J6(wrist pitch)
+    LT / RT     J3(upper arm roll)
+    LB / RB     J7(wrist roll)
+    A           gripper toggle
+    B           save + reset
+    X           assisted grasp
+    Y           precision mode
+
 Usage:
     sudo python3 wsl_recv.py                          # terminal 1
     python scripts/grow_tree.py --apples --foliage \  # terminal 2
@@ -20,10 +31,6 @@ from .gamepad import GamepadReader
 
 
 class GamepadPicker:
-    PHASE_DRIVE = 1
-    PHASE_GRASP = 2
-    PHASE_DEPOSIT = 3
-
     def __init__(self, sim, tm, wrist_cam, robot_driver, cfg,
                  dataset_dir: str = "demo_data"):
         self.sim = sim
@@ -40,9 +47,8 @@ class GamepadPicker:
         self._arm_home = np.asarray(rb["arm_home"], dtype=float)
         self._finger_tq = self._arm_tq[-2:]
         self._chassis = int(rb["chassis"][0])
-        self._wrist = int(rb["wrist"][0])
 
-        # IK init: use short joint names (strip "ridgeback_franka/" prefix)
+        # joint index map: short joint names
         labels = [l.rsplit("/", 1)[-1] for l in sim.model.joint_label]
         jqs = sim.model.joint_q_start.numpy()
         self._ik_qstart = []
@@ -62,32 +68,24 @@ class GamepadPicker:
         self.gamepad.start()
         self._prev_btn = {}
 
-        self.phase = self.PHASE_DRIVE
         self.gripper_open = True
         self._precision = False
+        self._j4_mode = True  # True=右摇杆X→J4, False=右摇杆X→J5
         self._buffer = []
         self._episode_id = _find_next_episode(self.dataset_dir)
-
-        # persistent IK target (world frame, updated by stick deltas)
-        self._ik_target_pos = None
-        self._ik_target_approach = None
 
         # assisted grasp
         self._g_path = None
         self._g_idx = 0
         self._assist_max = 0.20
         self._assist_steps = 15
-        self._move_speed = 0.015
-        self._fine_speed = 0.004
-        self._drive_speed = 0.5
-        self._turn_speed = 1.0
 
         os.makedirs(self.dataset_dir, exist_ok=True)
         print(f"[gamepad] recording to {self.dataset_dir}")
         print(f"[gamepad] ep={self._episode_id}  "
               f"B=save  X=assist  A=gripper  Y=precision")
         if not self.gamepad.connected:
-            print(f"[gamepad] ⚠ 手柄未连接，先运行 sudo python3 wsl_recv.py")
+            print(f"[gamepad] ⚠ 先运行 sudo python3 wsl_recv.py")
 
     def update(self, viewer=None):
         if not self.gamepad.connected:
@@ -99,8 +97,7 @@ class GamepadPicker:
 
         # edge detection
         just = {}
-        for btn in ("btn_a", "btn_b", "btn_x", "btn_y",
-                     "btn_lb", "btn_rb", "btn_start"):
+        for btn in ("btn_a", "btn_b", "btn_x", "btn_y", "btn_start"):
             prev = self._prev_btn.get(btn, False)
             just[btn] = s[btn] and not prev
             self._prev_btn[btn] = s[btn]
@@ -117,135 +114,67 @@ class GamepadPicker:
             self._precision = not self._precision
             print(f"  {'precision' if self._precision else 'normal'} mode")
         if just["btn_start"]:
-            raise KeyboardInterrupt()
+            self._j4_mode = not self._j4_mode
+            print(f"  right stick X → {'J4 elbow' if self._j4_mode else 'J5 forearm roll'}")
 
-        # stick curve (square: small push = fine, full push = fast)
+        # ---- 方向键 → 底盘位置增量 ----
+        dx = float(s["hat_y"]) * 0.04
+        dyaw = float(s["hat_x"]) * 0.06
+        if abs(dx) > 0.001 or abs(dyaw) > 0.001:
+            jq = self.sim.state_0.joint_q.numpy().copy()
+            for qs in self.tm.robot_data["planar_q"]:
+                yaw = float(jq[qs + 3])
+                jq[qs] += dx * math.cos(yaw)
+                jq[qs + 1] += dx * math.sin(yaw)
+                jq[qs + 3] += dyaw
+            self.sim.state_0.joint_q.assign(jq)
+            self.sim.model.joint_q.assign(jq)
+
+        # ---- 关节角直接控制（SO100 风格）----
         def _curve(x):
             sign = 1.0 if x >= 0 else -1.0
             return sign * (abs(x) ** 2.0)
 
-        # chassis
-        fwd = _curve(-s["left_y"])
-        turn = _curve(s["left_x"])
-        if abs(fwd) < 0.02: fwd = 0.0
-        if abs(turn) < 0.02: turn = 0.0
+        speed = 0.01 if self._precision else 0.04
+        dj = [0.0] * 7  # J1~J7
+        dj[0] = _curve(s["left_x"]) * speed     # J1 waist
+        dj[1] = _curve(s["left_y"]) * speed     # J2 shoulder
+        dj[2] = (s["lt"] - s["rt"]) * speed     # J3 upper arm roll (LT/RT)
+        if self._j4_mode:
+            dj[3] = _curve(s["right_x"]) * speed    # J4 elbow
+        else:
+            dj[4] = _curve(s["right_x"]) * speed    # J5 forearm roll
+        dj[5] = -_curve(s["right_y"]) * speed   # J6 wrist pitch
+        dj[6] = ((1.0 if s["btn_lb"] else 0.0) - (1.0 if s["btn_rb"] else 0.0)) * speed * 2  # J7
 
-        # arm
-        speed = self._fine_speed if self._precision else self._move_speed
-        dx = _curve(s["right_x"]) * speed
-        dy = _curve(s["right_y"]) * speed
-        dz = (s["rt"] - s["lt"]) * speed
+        has_input = any(abs(v) > 1e-8 for v in dj)
+        if has_input:
+            jq = self.sim.state_0.joint_q.numpy()
+            arm_q = jq[self._ik_qstart].copy()[:7]
+            for i in range(7):
+                arm_q[i] += dj[i]
+            self._tq_host[self._arm_tq[:7]] = arm_q
+            self.sim.control.joint_target_q.assign(self._tq_host)
 
-        dyaw = 0.0
-        dpitch = 0.0
-        droll = 0.0
-        if s["btn_lb"]: dyaw += 0.01
-        if s["btn_rb"]: dyaw -= 0.01
-        dpitch = s["hat_y"] * 0.01
-        droll = s["hat_x"] * 0.01
-
-        # assisted grasp step
+        # assisted grasp
         if self._g_path is not None:
             self._step_assist()
 
-        # arm IK
-        has_arm = abs(dx) > 1e-8 or abs(dy) > 1e-8 or abs(dz) > 1e-8 \
-                  or abs(dyaw) > 1e-8 or abs(dpitch) > 1e-8 or abs(droll) > 1e-8
-        if has_arm:
-            self._ik_move(dx, dy, dz, dyaw, dpitch, droll)
-
         # gripper
-        gv = 0.04 if self.gripper_open else 0.0
+        gv = 0.04 if self.gripper_open else -0.002
         self._tq_host[self._finger_tq] = gv
         self.sim.control.joint_target_q.assign(self._tq_host)
 
-        # chassis drive
-        if abs(fwd) > 0.01 or abs(turn) > 0.01:
-            self._drive_chassis(fwd, turn)
-
         self._record_frame()
 
-    # -- IK -------------------------------------------------------------------
-
-    def _ik_move(self, dx, dy, dz, dyaw, dpitch, droll):
-        """Persistent world-frame target, updated by chassis-frame stick deltas."""
-        bq = self.sim.state_0.body_q.numpy()
-        ch_p = bq[self._chassis, :3]
-        ch_q = bq[self._chassis, 3:7]
-        R_ch = self._q2r(ch_q)
-
-        # init persistent target from current pose
-        ee = bq[self._wrist, :3].copy()
-        if self._ik_target_pos is None:
-            self._ik_target_pos = ee.copy()
-            self._ik_target_approach = np.array([0.0, 0.0, -1.0])
-
-        # world-frame delta from chassis-frame stick input
-        dw = R_ch @ np.array([dx, dy, dz])
-        self._ik_target_pos += dw
-
-        # rotation (in world frame, convert approach back to chassis)
-        if abs(dyaw) > 1e-8 or abs(dpitch) > 1e-8 or abs(droll) > 1e-8:
-            Rz = np.array([[math.cos(dyaw), -math.sin(dyaw), 0],
-                           [math.sin(dyaw), math.cos(dyaw), 0],
-                           [0, 0, 1]])
-            Ry = np.array([[math.cos(dpitch), 0, math.sin(dpitch)],
-                           [0, 1, 0],
-                           [-math.sin(dpitch), 0, math.cos(dpitch)]])
-            Rx = np.array([[1, 0, 0],
-                           [0, math.cos(droll), -math.sin(droll)],
-                           [0, math.sin(droll), math.cos(droll)]])
-            aw = R_ch @ self._ik_target_approach
-            na = Rz @ Ry @ Rx @ aw
-            self._ik_target_approach = R_ch.T @ na
-            n = np.linalg.norm(self._ik_target_approach)
-            if n > 1e-6:
-                self._ik_target_approach /= n
-
-        # safety limits (world frame)
-        rel = self._ik_target_pos - ch_p
-        d = np.linalg.norm(rel)
-        if d > 0.65:
-            rel *= 0.65 / d
-            self._ik_target_pos = ch_p + rel
-        self._ik_target_pos[2] = np.clip(self._ik_target_pos[2], 0.05, 1.2)
-
-        # to chassis frame for IK
-        t_base = R_ch.T @ (self._ik_target_pos - ch_p)
-        app_base = self._ik_target_approach
-
-        jq = self.sim.state_0.joint_q.numpy()
-        q_init = jq[self._ik_qstart]
-
-        try:
-            qr, err = self.ik.solve(t_base, app_base, q_init, iters=32)
-            if err < 0.01:
-                self._tq_host[self._arm_tq] = qr[:len(self._arm_tq)]
-                self.sim.control.joint_target_q.assign(self._tq_host)
-        except Exception:
-            pass
-
-    def _drive_chassis(self, fwd, turn):
-        try:
-            q = self.sim.state_0.joint_q.numpy()
-            rb = self.tm.robot_data
-            for qs, ds in zip(rb["planar_q"], rb["planar_dof"]):
-                yaw = float(q[qs + 3])
-                self.drv._target_host[ds + 0] = fwd * self._drive_speed * math.cos(yaw)
-                self.drv._target_host[ds + 1] = fwd * self._drive_speed * math.sin(yaw)
-                self.drv._target_host[ds + 3] = turn * self._turn_speed
-            self.sim.control.joint_target_qd.assign(self.drv._target_host)
-        except Exception:
-            pass
-
-    # -- assisted grasp -------------------------------------------------------
+    # -- assisted grasp (IK, only when pressing X) ---------------------------
 
     def _start_assist(self):
         if self.sim.apples is None:
             return
         bq = self.sim.state_0.body_q.numpy()
         ab = self.tm.apple_data["apple_body"]
-        ee = bq[self._wrist, :3]
+        ee = bq[self._chassis + 1, :3]  # wrist approx
         best_dist = float("inf")
         best_pos = None
         for a in ab:
@@ -273,17 +202,16 @@ class GamepadPicker:
             return
         tgt = self._g_path[self._g_idx]
         self._g_idx += 1
-        bq = self.sim.state_0.joint_q.numpy()
-        ch_p = bq[self._chassis, :3]
-        ch_q = bq[self._chassis, 3:7]
+        ch_p = self.sim.state_0.body_q.numpy()[self._chassis, :3]
+        ch_q = self.sim.state_0.body_q.numpy()[self._chassis, 3:7]
         R_ch = self._q2r(ch_q)
         t_base = R_ch.T @ (tgt - ch_p)
         jq = self.sim.state_0.joint_q.numpy()
         q_init = jq[self._ik_qstart]
         try:
             qr, err = self.ik.solve(t_base, np.array([0, 0, -1]), q_init, iters=32)
-            if err < 0.02:
-                self._tq_host[self._arm_tq] = qr[:len(self._arm_tq)]
+            if err < 0.03:
+                self._tq_host[self._arm_tq[:len(qr)]] = qr[:len(self._arm_tq)]
                 self.sim.control.joint_target_q.assign(self._tq_host)
         except Exception:
             pass
@@ -335,8 +263,6 @@ class GamepadPicker:
         print(f"  [gamepad] saved ep{self._episode_id} ({T}f)")
         self._episode_id += 1
         self._buffer = []
-
-    # -- helpers --------------------------------------------------------------
 
     @staticmethod
     def _q2r(q):
